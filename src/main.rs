@@ -59,11 +59,10 @@ enum Commands {
         #[arg(long, value_name = "FREQ", value_parser = RECUR_CHOICES)]
         recur: Option<String>,
     },
-    #[command(about = "Delete a reminder by index or title (Mac only; does not sync to iPhone)")]
+    #[command(about = "Delete a reminder by title (Mac only; does not sync to iPhone)")]
     Rm {
-        index: Option<usize>,
         #[arg(long, value_name = "PATTERN")]
-        title: Option<String>,
+        title: String,
     },
     #[command(about = "Edit a reminder by index")]
     Edit {
@@ -162,7 +161,7 @@ fn main() {
             date,
             recur,
         }) => cmd_add(title, rel, at, date, recur),
-        Some(Commands::Rm { index, title }) => cmd_rm(index, title),
+        Some(Commands::Rm { title }) => cmd_rm(title),
         Some(Commands::Edit {
             index,
             title,
@@ -689,47 +688,34 @@ fn set_tombstone(data: &mut Value, uuid: &str, ts: i64) {
     dl.insert(uuid.to_string(), Value::Number(ts.into()));
 }
 
-fn cmd_rm(index: Option<usize>, title: Option<String>) {
+fn cmd_rm(title_pattern: String) {
     let mut data = read_db();
-    if let Some(title_pattern) = title {
-        let pattern = title_pattern.trim().to_lowercase();
-        let matches: Vec<Value> = reminders_slice(&data)
-            .iter()
-            .filter(|r| reminder_title(r).to_lowercase().contains(&pattern))
-            .cloned()
-            .collect();
+    let pattern = title_pattern.trim().to_lowercase();
+    let matches: Vec<Value> = reminders_slice(&data)
+        .iter()
+        .filter(|r| reminder_title(r).to_lowercase().contains(&pattern))
+        .cloned()
+        .collect();
 
-        if matches.is_empty() {
-            fatal(format!("No reminders matching '{}'.", title_pattern));
-        }
-
-        let now = now_ts();
-        for reminder in &matches {
-            let uuid = reminder_uuid(reminder).unwrap_or_else(|| fatal("Reminder is missing UUID"));
-            let title = reminder_title(reminder);
-            let raw = reminders_mut(&mut data);
-            let pos = raw
-                .iter()
-                .position(|r| reminder_uuid(r).as_deref() == Some(uuid.as_str()))
-                .unwrap_or_else(|| fatal("Reminder UUID not found during delete"));
-            raw.remove(pos);
-            set_tombstone(&mut data, &uuid, now);
-            println!("Deleted: '{}'", title);
-        }
-        write_db(&data);
-        run_best_effort("open", &["-a", "Due"]);
-        return;
+    if matches.is_empty() {
+        fatal(format!("No reminders matching '{}'.", title_pattern));
     }
 
-    let index = index.unwrap_or_else(|| fatal("Error: provide an index or --title."));
-    let (raw_idx, removed) = get_reminder(&data, index);
-    let uuid = reminder_uuid(&removed).unwrap_or_else(|| fatal("Reminder is missing UUID"));
-    let title = reminder_title(&removed);
-    reminders_mut(&mut data).remove(raw_idx);
-    set_tombstone(&mut data, &uuid, now_ts());
+    let now = now_ts();
+    for reminder in &matches {
+        let uuid = reminder_uuid(reminder).unwrap_or_else(|| fatal("Reminder is missing UUID"));
+        let title = reminder_title(reminder);
+        let raw = reminders_mut(&mut data);
+        let pos = raw
+            .iter()
+            .position(|r| reminder_uuid(r).as_deref() == Some(uuid.as_str()))
+            .unwrap_or_else(|| fatal("Reminder UUID not found during delete"));
+        raw.remove(pos);
+        set_tombstone(&mut data, &uuid, now);
+        println!("Deleted: '{}'", title);
+    }
     write_db(&data);
     run_best_effort("open", &["-a", "Due"]);
-    println!("Deleted: '{}'", title);
 }
 
 fn cmd_edit(
