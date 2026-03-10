@@ -79,6 +79,13 @@ enum Commands {
         #[arg(long, help = "Open Due after edit to trigger CloudKit sync to iPhone")]
         sync: bool,
     },
+    #[command(about = "Show completion history from Due DB")]
+    Log {
+        #[arg(long, short, default_value = "20", help = "Number of entries to show")]
+        n: usize,
+        #[arg(long, help = "Filter by title substring (case-insensitive)")]
+        filter: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -95,6 +102,51 @@ struct ComparableSnapshotReminder {
     title: String,
     due: Option<i64>,
     recur: Option<String>,
+}
+
+fn cmd_log(n: usize, filter: Option<String>) {
+    let data = read_db();
+    let mut entries: Vec<_> = data
+        .get("lb")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().collect())
+        .unwrap_or_default();
+
+    // Sort by completion time descending
+    entries.sort_by(|a, b| {
+        b.get("m").and_then(Value::as_i64).unwrap_or(0)
+            .cmp(&a.get("m").and_then(Value::as_i64).unwrap_or(0))
+    });
+
+    // Apply filter
+    let filter_lower = filter.as_deref().map(str::to_lowercase);
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|r| {
+            if let Some(ref f) = filter_lower {
+                r.get("n").and_then(Value::as_str).unwrap_or("").to_lowercase().contains(f.as_str())
+            } else {
+                true
+            }
+        })
+        .take(n)
+        .collect();
+
+    if entries.is_empty() {
+        println!("No completions found.");
+        return;
+    }
+
+    println!("{:<20} {}", "Completed (HKT)", "Title");
+    println!("{}", "─".repeat(68));
+    for r in entries {
+        let ts = r.get("m").and_then(Value::as_i64).unwrap_or(0);
+        let dt = Utc.timestamp_opt(ts, 0).single()
+            .map(|t| t.with_timezone(&Hong_Kong).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let title = r.get("n").and_then(Value::as_str).unwrap_or("").chars().take(46).collect::<String>();
+        println!("{:<20} {}", dt, title);
+    }
 }
 
 fn main() {
@@ -119,6 +171,7 @@ fn main() {
             date,
             sync,
         }) => cmd_edit(index, title, rel, at, date, sync),
+        Some(Commands::Log { n, filter }) => cmd_log(n, filter),
         None => {
             let _ = Cli::command().print_help();
             println!();
