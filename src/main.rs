@@ -75,8 +75,6 @@ enum Commands {
         at: Option<String>,
         #[arg(long, value_name = "YYYY-MM-DD")]
         date: Option<String>,
-        #[arg(long, help = "Open Due after edit to trigger CloudKit sync to iPhone")]
-        sync: bool,
     },
     #[command(about = "Show completion history from Due DB")]
     Log {
@@ -168,8 +166,7 @@ fn main() {
             rel,
             at,
             date,
-            sync,
-        }) => cmd_edit(index, title, rel, at, date, sync),
+        }) => cmd_edit(index, title, rel, at, date),
         Some(Commands::Log { n, filter }) => cmd_log(n, filter),
         None => {
             let _ = Cli::command().print_help();
@@ -724,44 +721,56 @@ fn cmd_edit(
     rel: Option<String>,
     at: Option<String>,
     date: Option<String>,
-    sync: bool,
 ) {
     let mut data = read_db();
-    let (raw_idx, mut reminder) = get_reminder(&data, index);
+    let (raw_idx, reminder) = get_reminder(&data, index);
+    let current_title = reminder
+        .get("n")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| fatal("Reminder is missing title"))
+        .to_string();
+    let current_due_ts = reminder
+        .get("d")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| fatal("Reminder is missing due timestamp"));
+    let recur = recur_label(reminder.get("rf").and_then(Value::as_str));
+    let uuid = reminder_uuid(&reminder).unwrap_or_else(|| fatal("Reminder is missing UUID"));
+
+    let new_title = title.unwrap_or_else(|| current_title.clone());
+    let new_due_ts =
+        parse_time(rel.as_deref(), at.as_deref(), date.as_deref()).unwrap_or(current_due_ts);
     let mut changed = Vec::new();
 
-    if let Some(title) = title {
-        reminder
-            .as_object_mut()
-            .unwrap_or_else(|| fatal("Reminder is not a JSON object"))
-            .insert("n".to_string(), Value::String(title.clone()));
-        changed.push(format!("title → '{}'", title));
+    if new_title != current_title {
+        changed.push(format!("title → '{}'", new_title));
     }
 
-    if let Some(due_ts) = parse_time(rel.as_deref(), at.as_deref(), date.as_deref()) {
-        reminder
-            .as_object_mut()
-            .unwrap_or_else(|| fatal("Reminder is not a JSON object"))
-            .insert("d".to_string(), Value::Number(due_ts.into()));
-        changed.push(format!("due → {}", fmt_ts(due_ts)));
+    if new_due_ts != current_due_ts {
+        changed.push(format!("due → {}", fmt_ts(new_due_ts)));
     }
 
     if changed.is_empty() {
         fatal("Nothing to change. Use --title, --in, --at, or --date.");
     }
 
-    reminder
-        .as_object_mut()
-        .unwrap_or_else(|| fatal("Reminder is not a JSON object"))
-        .insert("m".to_string(), Value::Number(now_ts().into()));
-
-    reminders_mut(&mut data)[raw_idx] = reminder;
+    reminders_mut(&mut data).remove(raw_idx);
+    set_tombstone(&mut data, &uuid, now_ts());
     write_db(&data);
-    println!("Updated #{}: {}", index, changed.join(", "));
-    if sync {
-        run_best_effort("open", &["-a", "Due"]);
-        sleep(Duration::from_secs(1));
-        println!("Due opened — changes should sync to iPhone via CloudKit shortly.");
+
+    let ok = sync_via_applescript(&new_title, new_due_ts, recur.as_deref());
+    if ok {
+        println!(
+            "Updated #{}: {} — synced to iPhone via CloudKit (AppleScript)",
+            index,
+            changed.join(", ")
+        );
+        git_snapshot(&read_db());
+    } else {
+        println!(
+            "Updated #{}: {} — Due editor open, please click Save manually to sync to iPhone.",
+            index,
+            changed.join(", ")
+        );
     }
 }
 
