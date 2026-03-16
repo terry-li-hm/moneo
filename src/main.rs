@@ -870,3 +870,79 @@ fn cmd_snapshot() {
         reminders_slice(&data).len()
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_due_time_only() {
+        let (at, date) = parse_due_string("16:15");
+        assert_eq!(at, Some("16:15".to_string()));
+        assert_eq!(date, None);
+    }
+
+    #[test]
+    fn parse_due_date_only() {
+        let (at, date) = parse_due_string("2026-03-16");
+        assert_eq!(at, None);
+        assert_eq!(date, Some("2026-03-16".to_string()));
+    }
+
+    #[test]
+    fn parse_due_today_with_time() {
+        let (at, date) = parse_due_string("today 10:00");
+        assert_eq!(at, Some("10:00".to_string()));
+        // date should be today's date
+        let today = hkt_now().format("%Y-%m-%d").to_string();
+        assert_eq!(date, Some(today));
+    }
+
+    #[test]
+    fn parse_due_tomorrow_with_time() {
+        let (at, date) = parse_due_string("tomorrow 09:00");
+        assert_eq!(at, Some("09:00".to_string()));
+        let tomorrow = (hkt_now() + ChronoDuration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(date, Some(tomorrow));
+    }
+
+    #[test]
+    fn parse_due_iso_date_with_time() {
+        let (at, date) = parse_due_string("2026-12-25 14:30");
+        assert_eq!(at, Some("14:30".to_string()));
+        assert_eq!(date, Some("2026-12-25".to_string()));
+    }
+
+    #[test]
+    fn parse_due_today_keyword_alone() {
+        let (at, date) = parse_due_string("today");
+        assert_eq!(at, None);
+        let today = hkt_now().format("%Y-%m-%d").to_string();
+        assert_eq!(date, Some(today));
+    }
+
+    #[test]
+    fn parse_due_tomorrow_keyword_alone() {
+        let (at, date) = parse_due_string("tomorrow");
+        assert_eq!(at, None);
+        let tomorrow = (hkt_now() + ChronoDuration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(date, Some(tomorrow));
+    }
+
+    #[test]
+    fn resolve_date_keyword_today() {
+        let today = hkt_now().format("%Y-%m-%d").to_string();
+        assert_eq!(resolve_date_keyword("today"), today);
+        assert_eq!(resolve_date_keyword("Today"), today);
+        assert_eq!(resolve_date_keyword("TODAY"), today);
+    }
+
+    #[test]
+    fn resolve_date_keyword_passthrough() {
+        assert_eq!(resolve_date_keyword("2026-03-16"), "2026-03-16");
+    }
+}
