@@ -56,12 +56,14 @@ enum Commands {
         at: Option<String>,
         #[arg(long, value_name = "YYYY-MM-DD")]
         date: Option<String>,
+        #[arg(long, value_name = "WHEN", help = "Date and/or time: 'today 16:15', 'tomorrow 09:00', '2026-03-16 10:00', 'today', '16:15'")]
+        due: Option<String>,
         #[arg(long, value_name = "FREQ", value_parser = RECUR_CHOICES)]
         recur: Option<String>,
     },
-    #[command(about = "Delete a reminder by title (Mac only; does not sync to iPhone)")]
+    #[command(about = "Delete a reminder by title (Mac only; does not sync to iPhone)", alias = "delete")]
     Rm {
-        #[arg(long, value_name = "PATTERN")]
+        #[arg(value_name = "PATTERN")]
         title: String,
     },
     #[command(about = "Edit a reminder by index")]
@@ -157,8 +159,9 @@ fn main() {
             rel,
             at,
             date,
+            due,
             recur,
-        }) => cmd_add(title, rel, at, date, recur),
+        }) => cmd_add(title, rel, at, date, due, recur),
         Some(Commands::Rm { title }) => cmd_rm(title),
         Some(Commands::Edit {
             index,
@@ -408,6 +411,36 @@ fn recur_freq(freq: &str) -> Option<i32> {
     }
 }
 
+fn parse_due_string(due: &str) -> (Option<String>, Option<String>) {
+    let parts: Vec<&str> = due.split_whitespace().collect();
+    match parts.len() {
+        1 => {
+            let p = parts[0];
+            if p.contains(':') {
+                (Some(p.to_string()), None) // just a time like "16:15"
+            } else {
+                // date keyword or YYYY-MM-DD
+                (None, Some(resolve_date_keyword(p)))
+            }
+        }
+        2 => {
+            let date_str = resolve_date_keyword(parts[0]);
+            let time_str = parts[1].to_string();
+            (Some(time_str), Some(date_str))
+        }
+        _ => fatal(format!("Error: invalid --due '{due}'. Use e.g. 'today 16:15', 'tomorrow', '2026-03-16 10:00'.")),
+    }
+}
+
+fn resolve_date_keyword(s: &str) -> String {
+    let now = hkt_now();
+    match s.to_lowercase().as_str() {
+        "today" => now.format("%Y-%m-%d").to_string(),
+        "tomorrow" => (now + ChronoDuration::days(1)).format("%Y-%m-%d").to_string(),
+        other => other.to_string(), // assume YYYY-MM-DD
+    }
+}
+
 fn parse_time(rel: Option<&str>, at: Option<&str>, date: Option<&str>) -> Option<i64> {
     let now = hkt_now();
 
@@ -639,10 +672,19 @@ fn cmd_add(
     rel: Option<String>,
     at: Option<String>,
     date: Option<String>,
+    due: Option<String>,
     recur: Option<String>,
 ) {
+    let (at, date) = if let Some(ref due_str) = due {
+        if at.is_some() || date.is_some() {
+            fatal("Error: --due cannot be combined with --at or --date.");
+        }
+        parse_due_string(due_str)
+    } else {
+        (at, date)
+    };
     let due_ts = parse_time(rel.as_deref(), at.as_deref(), date.as_deref())
-        .unwrap_or_else(|| fatal("Error: specify a time with --in, --at, or --date."));
+        .unwrap_or_else(|| fatal("Error: specify a time with --in, --at, --date, or --due."));
 
     if let Some(dup) = find_duplicate(&title, due_ts) {
         let existing_due = reminder_due_ts(&dup).unwrap_or(0);
