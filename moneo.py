@@ -243,6 +243,44 @@ def reminders_slice(data: dict[str, Any]) -> list[dict[str, Any]]:
     return reminders if isinstance(reminders, list) else []
 
 
+def active_reminders(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return reminders excluding entries that appear in the logbook (completed).
+
+    Cross-references against data["lb"] using (title, due_ts) tuples.  Logbook
+    entries use "n" for title and "d" for the original due timestamp (same field
+    names as reminder entries).  If a logbook entry lacks "d", it is matched by
+    title alone to stay conservative.
+    """
+    logbook = data.get("lb")
+    if not isinstance(logbook, list) or not logbook:
+        return reminders_slice(data)
+
+    # Build completed sets: prefer (title, due_ts) pairs; fall back to title-only
+    # for logbook entries that lack a "d" field.
+    completed_pairs: set[tuple[str, int]] = set()
+    completed_titles_only: set[str] = set()
+    for entry in logbook:
+        title = str(entry.get("n", "")).strip().lower()
+        if not title:
+            continue
+        due_ts = entry.get("d")
+        if isinstance(due_ts, int):
+            completed_pairs.add((title, due_ts))
+        else:
+            completed_titles_only.add(title)
+
+    active: list[dict[str, Any]] = []
+    for reminder in reminders_slice(data):
+        title = reminder_title(reminder).strip().lower()
+        due_ts = reminder_due_ts(reminder)
+        if due_ts is not None and (title, due_ts) in completed_pairs:
+            continue
+        if due_ts is None and title in completed_titles_only:
+            continue
+        active.append(reminder)
+    return active
+
+
 def reminders_mut(data: dict[str, Any]) -> list[dict[str, Any]]:
     reminders = data.setdefault("re", [])
     if not isinstance(reminders, list):
@@ -302,7 +340,7 @@ def recur_freq(freq: str) -> int | None:
 def find_duplicate(title: str, due_ts: int, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
     due_dt = hkt_from_ts(due_ts)
     normalized = title.strip().lower()
-    haystack = reminders_slice(data or read_db())
+    haystack = active_reminders(data or read_db())
     for reminder in haystack:
         if reminder_title(reminder).strip().lower() != normalized:
             continue
