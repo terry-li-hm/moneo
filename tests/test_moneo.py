@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import copy
 from datetime import datetime
 
 import moneo
@@ -98,3 +100,152 @@ def test_expand_schedule_can_include_night() -> None:
         "2026-03-17 15:00",
         "2026-03-17 21:00",
     ]
+
+
+# --- recur_code ---
+
+
+def test_recur_code_all_frequencies() -> None:
+    assert moneo.recur_code("daily") == "d"
+    assert moneo.recur_code("weekly") == "w"
+    assert moneo.recur_code("monthly") == "m"
+    assert moneo.recur_code("quarterly") == "q"
+    assert moneo.recur_code("yearly") == "y"
+
+
+def test_recur_code_unknown_returns_none() -> None:
+    assert moneo.recur_code("hourly") is None
+    assert moneo.recur_code("") is None
+
+
+# --- generate_uuid ---
+
+
+def test_generate_uuid_format() -> None:
+    uid = moneo.generate_uuid()
+    assert isinstance(uid, str)
+    assert len(uid) == 22  # base64url of 16 bytes, no padding
+    assert "=" not in uid
+    # Should decode back to 16 bytes
+    raw = base64.urlsafe_b64decode(uid + "==")
+    assert len(raw) == 16
+
+
+def test_generate_uuid_uniqueness() -> None:
+    uuids = {moneo.generate_uuid() for _ in range(100)}
+    assert len(uuids) == 100
+
+
+# --- make_reminder ---
+
+
+def test_make_reminder_basic() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    reminder = moneo.make_reminder("Test reminder", ts, None, None)
+    assert reminder["n"] == "Test reminder"
+    assert reminder["d"] == ts
+    assert reminder["si"] == 300  # default 5 min autosnooze
+    assert "u" in reminder
+    assert len(reminder["u"]) == 22
+    assert "b" in reminder  # created timestamp
+    assert "m" in reminder  # modified timestamp
+    assert "rf" not in reminder  # no recurrence
+
+
+def test_make_reminder_with_autosnooze() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    reminder = moneo.make_reminder("Test", ts, None, 15)
+    assert reminder["si"] == 900  # 15 * 60
+
+
+def test_make_reminder_daily_recurrence() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    reminder = moneo.make_reminder("Daily", ts, "daily", None)
+    assert reminder["rf"] == "d"
+    assert reminder["rd"] == ts
+    assert reminder["rn"] == 16  # daily unit
+
+
+def test_make_reminder_weekly_recurrence() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    reminder = moneo.make_reminder("Weekly", ts, "weekly", None)
+    assert reminder["rf"] == "w"
+    assert reminder["rd"] == ts
+    assert reminder["rn"] == 256  # weekly unit
+    assert "rb" in reminder  # weekday byday
+
+
+def test_make_reminder_quarterly_recurrence() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    reminder = moneo.make_reminder("Quarterly", ts, "quarterly", None)
+    assert reminder["rf"] == "q"
+    assert reminder["ru"] == {"i": 3}  # interval 3 months
+
+
+# --- add_direct ---
+
+
+def _empty_db() -> dict:
+    return {"re": [], "mt": {"ts": 0}, "dl": {}}
+
+
+def test_add_direct_appends_to_data() -> None:
+    data = _empty_db()
+    uid = moneo.add_direct("Test", 1000000, None, None, data)
+    assert len(data["re"]) == 1
+    assert data["re"][0]["u"] == uid
+    assert data["re"][0]["n"] == "Test"
+
+
+def test_add_direct_multiple() -> None:
+    data = _empty_db()
+    moneo.add_direct("First", 1000000, None, None, data)
+    moneo.add_direct("Second", 2000000, None, None, data)
+    assert len(data["re"]) == 2
+    titles = {r["n"] for r in data["re"]}
+    assert titles == {"First", "Second"}
+
+
+def test_add_direct_preserves_existing() -> None:
+    data = _empty_db()
+    data["re"].append({"u": "existing123456789012", "n": "Existing", "d": 500000})
+    moneo.add_direct("New", 1000000, None, None, data)
+    assert len(data["re"]) == 2
+    assert data["re"][0]["n"] == "Existing"
+    assert data["re"][1]["n"] == "New"
+
+
+# --- find_duplicate ---
+
+
+def test_find_duplicate_detects_same_title_and_time() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    data = _empty_db()
+    data["re"].append({"u": "abc", "n": "Med reminder", "d": ts})
+    result = moneo.find_duplicate("Med reminder", ts, data)
+    assert result is not None
+
+
+def test_find_duplicate_case_insensitive() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    data = _empty_db()
+    data["re"].append({"u": "abc", "n": "Med Reminder", "d": ts})
+    result = moneo.find_duplicate("med reminder", ts, data)
+    assert result is not None
+
+
+def test_find_duplicate_different_time_no_match() -> None:
+    ts1 = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    ts2 = int(datetime(2026, 3, 20, 14, 0, tzinfo=moneo.HKT).timestamp())
+    data = _empty_db()
+    data["re"].append({"u": "abc", "n": "Med reminder", "d": ts1})
+    result = moneo.find_duplicate("Med reminder", ts2, data)
+    assert result is None
+
+
+def test_find_duplicate_different_title_no_match() -> None:
+    ts = int(datetime(2026, 3, 20, 10, 0, tzinfo=moneo.HKT).timestamp())
+    data = _empty_db()
+    data["re"].append({"u": "abc", "n": "Med reminder", "d": ts})
+    result = moneo.find_duplicate("Different", ts, data)
+    assert result is None

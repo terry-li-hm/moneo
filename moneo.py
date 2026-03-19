@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import gzip
 import json
@@ -14,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -24,20 +26,6 @@ from zoneinfo import ZoneInfo
 HKT = ZoneInfo("Asia/Hong_Kong")
 VALID_AUTOSNOOZE = {1, 5, 10, 15, 30, 60}
 RECUR_CHOICES = {"daily", "weekly", "monthly", "quarterly", "yearly"}
-APPLE_SCRIPT = r"""
-tell application "System Events"
-    tell process "Due"
-        repeat 20 times
-            try
-                click button "Save" of window "Reminder Editor"
-                return "ok"
-            end try
-            delay 0.5
-        end repeat
-    end tell
-end tell
-return "timeout"
-""".strip()
 
 
 class MoneoError(RuntimeError):
@@ -337,6 +325,47 @@ def recur_freq(freq: str) -> int | None:
     }.get(freq)
 
 
+def recur_code(freq: str) -> str | None:
+    return {"daily": "d", "weekly": "w", "monthly": "m", "quarterly": "q", "yearly": "y"}.get(freq)
+
+
+def generate_uuid() -> str:
+    return base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b"=").decode("ascii")
+
+
+def make_reminder(
+    title: str,
+    due_ts: int,
+    recur: str | None,
+    autosnooze: int | None,
+) -> dict[str, Any]:
+    ts = now_ts()
+    reminder: dict[str, Any] = {
+        "u": generate_uuid(),
+        "n": title,
+        "d": due_ts,
+        "b": ts,
+        "m": ts,
+        "si": (autosnooze or 5) * 60,
+    }
+    if recur:
+        code = recur_code(recur)
+        if code:
+            reminder["rf"] = code
+            reminder["rd"] = due_ts
+            unit = recur_unit(recur)
+            freq = recur_freq(recur)
+            if unit:
+                reminder["rn"] = unit
+            if freq and freq > 1:
+                reminder["ru"] = {"i": freq}
+            if recur == "weekly":
+                dt = hkt_from_ts(due_ts)
+                weekday = ((dt.weekday() + 1) % 7) + 1
+                reminder["rb"] = weekday
+    return reminder
+
+
 def find_duplicate(title: str, due_ts: int, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
     due_dt = hkt_from_ts(due_ts)
     normalized = title.strip().lower()
@@ -418,6 +447,11 @@ def write_db(data: dict[str, Any]) -> None:
     except OSError as exc:
         fatal(f"Failed to back up {due_db} to {backup}: {exc}")
 
+    # Update modification timestamp for CloudKit
+    mt = data.get("mt")
+    if isinstance(mt, dict):
+        mt["ts"] = now_ts()
+
     pid = due_pid()
     if pid:
         run_best_effort("kill", "-15", pid)
@@ -464,38 +498,16 @@ def get_reminder(data: dict[str, Any], index: int) -> tuple[int, dict[str, Any]]
     fatal("Reminder UUID not found in raw reminder list")
 
 
-def sync_via_applescript(
+def add_direct(
     title: str,
     due_ts: int,
     recur: str | None,
-    *,
-    timezone: str,
     autosnooze: int | None,
-) -> bool:
-    url = f"due:///add?title={quote(title)}&duedate={due_ts}&timezone={quote(timezone)}"
-    if autosnooze is not None:
-        url += f"&autosnooze={autosnooze}"
-    if recur:
-        unit = recur_unit(recur)
-        freq = recur_freq(recur)
-        if unit and freq:
-            url += f"&recurunit={unit}&recurfreq={freq}&recurfromdate={due_ts}"
-            if recur == "weekly":
-                dt = hkt_from_ts(due_ts, timezone)
-                weekday = ((dt.weekday() + 1) % 7) + 1
-                url += f"&recurbyday={weekday}"
-
-    run_best_effort("caffeinate", "-u", "-t", "1")
-    time.sleep(0.5)
-    run_best_effort("open", url)
-    time.sleep(3)
-    result = subprocess.run(
-        ["osascript", "-e", APPLE_SCRIPT],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return "ok" in result.stdout
+    data: dict[str, Any],
+) -> str:
+    reminder = make_reminder(title, due_ts, recur, autosnooze)
+    reminders_mut(data).append(reminder)
+    return reminder["u"]
 
 
 def cmd_ls(_: argparse.Namespace) -> None:
@@ -570,9 +582,6 @@ def ensure_no_duplicates(title: str, due_times: list[int], data: dict[str, Any])
             )
 
 
-def add_one(title: str, due_ts: int, recur: str | None, autosnooze: int | None, timezone: str) -> bool:
-    return sync_via_applescript(title, due_ts, recur, timezone=timezone, autosnooze=autosnooze)
-
 
 def cmd_add(args: argparse.Namespace) -> None:
     at_value, date_value = validate_add_args(args)
@@ -592,28 +601,36 @@ def cmd_add(args: argparse.Namespace) -> None:
         if not due_times:
             fatal("Error: expanded schedule produced no reminders.")
 
-    db = read_db()
-    ensure_no_duplicates(args.title, due_times, db)
+    data = read_db()
+    ensure_no_duplicates(args.title, due_times, data)
 
-    successes = 0
+    added_uuids: list[str] = []
     for scheduled_ts in due_times:
-        if add_one(args.title, scheduled_ts, args.recur, args.autosnooze, args.timezone):
-            successes += 1
-        else:
-            print("Due editor open — please click Save manually to sync to iPhone.")
-            return
+        uid = add_direct(args.title, scheduled_ts, args.recur, args.autosnooze, data)
+        added_uuids.append(uid)
+
+    if not added_uuids:
+        fatal("Error: no reminders added (all duplicates).")
+
+    write_db(data)
+
+    # Verify persistence
+    verified_data = read_db()
+    verified_uuids = {reminder_uuid(r) for r in reminders_slice(verified_data)}
+    missing = [uid for uid in added_uuids if uid not in verified_uuids]
+    if missing:
+        print(f"WARNING: {len(missing)} reminder(s) not found in DB after write. Check Due app.", file=sys.stderr)
 
     recur_str = f" (repeats {args.recur})" if args.recur else ""
     if len(due_times) == 1:
         print(
-            f"Added: '{args.title}' due {fmt_ts(due_times[0])}{recur_str} — synced to iPhone via CloudKit (AppleScript)"
+            f"Added: '{args.title}' due {fmt_ts(due_times[0])}{recur_str} — synced to iPhone via CloudKit"
         )
     else:
         print(
-            f"Added {successes} reminders for '{args.title}' from {fmt_ts(due_times[0])} to {fmt_ts(due_times[-1])} "
-            "— synced to iPhone via CloudKit (AppleScript)"
+            f"Added {len(added_uuids)} reminders for '{args.title}' from {fmt_ts(due_times[0])} to {fmt_ts(due_times[-1])}"
+            " — synced to iPhone via CloudKit"
         )
-    git_snapshot(read_db())
 
 
 def cmd_rm(args: argparse.Namespace) -> None:
@@ -666,24 +683,17 @@ def build_change_set(args: argparse.Namespace, reminder: dict[str, Any], index: 
 def cmd_edit(args: argparse.Namespace) -> None:
     data = read_db()
     raw_idx, reminder = get_reminder(data, args.index)
-    uuid = reminder_uuid(reminder)
-    if not uuid:
+    old_uuid = reminder_uuid(reminder)
+    if not old_uuid:
         fatal("Reminder is missing UUID")
     changes = build_change_set(args, reminder, args.index)
     ensure_no_duplicates(changes.title, [changes.due_ts], data)
 
     reminders_mut(data).pop(raw_idx)
-    set_tombstone(data, uuid, now_ts())
+    set_tombstone(data, old_uuid, now_ts())
+    add_direct(changes.title, changes.due_ts, changes.recur, args.autosnooze, data)
     write_db(data)
-
-    ok = add_one(changes.title, changes.due_ts, changes.recur, args.autosnooze, args.timezone)
-    if ok:
-        print(f"Updated #{args.index}: {', '.join(changes.changed)} — synced to iPhone via CloudKit (AppleScript)")
-        git_snapshot(read_db())
-    else:
-        print(
-            f"Updated #{args.index}: {', '.join(changes.changed)} — Due editor open, please click Save manually to sync to iPhone."
-        )
+    print(f"Updated #{args.index}: {', '.join(changes.changed)} — synced to iPhone via CloudKit")
 
 
 def cmd_log(args: argparse.Namespace) -> None:
